@@ -1,0 +1,1128 @@
+---
+title: "Predictive analysis for psychological stress affecting academic performance"
+author: Saikrithika Gandhi
+output: 
+  pdf_document:
+    number_sections: true
+---
+
+```{r results='hide',error=FALSE, message=FALSE, echo=FALSE }
+library(tidyverse)
+library(MASS)
+library(ggplot2)
+library(stringr)
+library(ISLR)
+library(readr)
+library(plyr)
+library(leaps)
+library(bestglm)
+library(glmnet)
+library(reshape2)
+```
+
+# Introduction
+
+My father-in-law is working on a thesis for his masters program in psychology. I found the  project to be very interesting. The project analyzes one of the most common problems faced by  children in the competitive world. Yes, it is stress. The problem is to identify the effect stress and study habits on the academic performance of adolescent children in the age group of 12 to 15 years(teen agers). 
+
+## The psychology study
+Three type of stress categories were designed. They are: **Environmental**,  **Psychological**, and **Cognitive**. Some examples:
+
+**Environment Questions**: Lack of mutual help, difficult to study at home.
+
+**Psychological**: Lack of self-confidence, worrying about exams.
+
+**Cognitive**: Lack of concentration, slow in getting along with curriculum. 
+
+
+For the first two categories 12 questions were used and 6 questions for the third category. These questions were taken from a prior psychology work where the author used it for college level children and has proven reliability. The questionnaire has been adapted for adolescent students. The questions were also translated to the local language to ensure that the intent of the questions were clearly understood by the students. The students were also told about the confidentiality of the survey and could answer the questions without bias. Scores from 1 to 5 are given to each question and each score denotes the stress --- 1 implies no stress, 5 means extremely-high stress.
+
+The study was administered in a government-run school (corporation school) and a private school. Each group had about 60 students each. There is already some psychological counselling in the corporation school. The male-female ratio is nearly equal.  
+
+## Statistical analysis
+Based on this dataset I am trying to do an analysis to see:
+
+1. Whether a subset of few questions can be good indicators. A smaller set of questions helps as a guide for the counsellor to focus on important issues in counselling. 
+2. Do the stress levels reported affect the performance. 
+    - Whether certain categories of stress affect academic performance.
+4. Are stresses different based on gender or the school
+    - Again, whether the categories of stress can be good predictors.
+
+These motivations naturally lead to prediction-like questions. To see if there is a difference in stresses between the private and corporation school, we can use all the stresses as predictors and try to predict the response variable, the school. That is we can use the stresses to classify the school type.
+
+Similarly if we can predict the gender based on the answers to the questions we can use the predictive model to infer how the stresses impact boys and girls differently.
+
+## Future study.
+
+In this report I have only considered the impact of stresses. The dissertation also has other data on study habits and self-esteem. These are based on other questionnaires. I will work on these next. I also plan to combine all these datasets to understand the overall psychological profile of the students. 
+  
+
+# Data Cleaning
+
+- merge datasets from different classes and schools
+- adding new columns for school category
+- fix data entry errors
+    - dropping empty columns
+    - fix inconsistent naming between datasets
+    - replace the score 0 with 1
+- convert Grade, School and Gender to factors
+- remove observations with missing values
+- normalize grade
+- drop names to anonymize the data
+
+```{r input-and-clean-data, message=FALSE,echo=TRUE,error=FALSE,warning=FALSE}
+
+setwd("~/Psychology project/Diff_stress_grouped")
+filename_stress_grouped = list.files(path="~/Psychology project/Diff_stress_grouped",
+                                     pattern = "*.csv")
+
+stress_grouped_raw_data <- lapply(filename_stress_grouped,
+                               function(i){
+                                 read.csv(i, header=T,skip=3)
+                               })
+filename_split_st <- strsplit(filename_stress_grouped, " ")
+colnames(stress_grouped_raw_data[[1]])=colnames(stress_grouped_raw_data[[2]])
+
+# colnames have to be identical before merging
+stopifnot(identical(colnames(stress_grouped_raw_data[[2]]),
+          colnames(stress_grouped_raw_data[[1]])))
+
+#  include column name for the dataset
+stress_grouped_raw_data[[1]]$school <- rep("corp", nrow(stress_grouped_raw_data[[1]]))
+stress_grouped_raw_data[[2]]$school <- rep("pvt", nrow(stress_grouped_raw_data[[2]]))
+
+# Merge datasets
+df_stress_group <- do.call(rbind.data.frame, stress_grouped_raw_data)
+colnames(df_stress_group) = do.call(rbind, 
+                                    strsplit(colnames(df_stress_group), "[.]"))[,1]
+# empty columns removed
+df_diff_stress_group<-df_stress_group[,-(36:37)]
+df_diff_stress_group_removed<-df_diff_stress_group[,-(1:3)]
+
+# Conversion to factors
+df_diff_stress_group_removed$school <- as.factor(df_diff_stress_group_removed$school)
+
+# changed column name
+colnames(df_diff_stress_group_removed)[2] <- "Grade"
+
+# changed grade C to B
+df_diff_stress_group_removed$Grade <- mapvalues(df_diff_stress_group_removed$Grade, 
+                                                from = ("C"), to = ("B")) 
+
+# Removed NA 
+df_diff_stress_group_removed <- df_diff_stress_group_removed %>% filter(!is.na(Q30))
+
+# replace score 0 with score 1
+df_diff_stress_group_removed[df_diff_stress_group_removed == 0] = 1
+
+df_diff_stress_group_removed$Q7 <- as.integer(df_diff_stress_group_removed$Q7)
+df_diff_stress_group_removed$Q11 <- as.integer(df_diff_stress_group_removed$Q11)
+df_diff_stress_group_removed$Q26 <- as.integer(df_diff_stress_group_removed$Q26)
+```
+
+Setup variables for validation. Take 60% of the data for training and the rest for test.
+
+```{r setup-prediction-variables, echo=TRUE, message=FALSE}
+set.seed(1)
+train = sample(seq(112), 67, replace = FALSE)
+test = seq(112)[-train]
+grid = 10 ^ seq (10, -2, length = 100)
+```
+
+# Description of the dataset
+
+```{r}
+# 33 variables
+colnames(df_diff_stress_group_removed)
+# 112 observations
+nrow(df_diff_stress_group_removed)
+# some factors
+str(df_diff_stress_group_removed$Grade)
+# Gender vs. school
+table(df_diff_stress_group_removed$Gender, df_diff_stress_group_removed$school)
+# Grade vs. gender
+table(df_diff_stress_group_removed$Grade, df_diff_stress_group_removed$Gender)
+```
+
+Q24 in the questionnaire asks if teachers lack an interest in students. There is a difference in the pattern of answers in the two schools --- in the private school there is a uniform distribution of scores; whereas the corporation school shows a skew.
+
+```{r}
+table(df_diff_stress_group_removed$school, df_diff_stress_group_removed$Q24)
+## Question 24 plot 
+ggplot(data = df_diff_stress_group_removed, aes(x = school, y = Q24, fill = school)) + geom_boxplot()
+```
+
+*Why not factors for all questions*
+
+1. explosion of predictors
+2. explainability of predictors
+3. potential overfitting based on answers.
+
+Similar arguments in https://www.machinelearningplus.com/machine-learning/logistic-regression-tutorial-examples-r/
+
+
+# Model building
+
+I have used various classification techniques to get good prediction accuracy about the students' grades, school or gender. Here are a list of approaches we will take in the next few sections.
+
+1. Predict school based on questions
+    1. Logistic regression with all variables
+    2. Reduce variables using Lasso
+    3. Try to do variable selection using p-values
+    4. LDA method
+    5. Variable selection using thresholding
+    6. Comparison of all these methods.
+2. Using the same methods described above predict academic performance (Grade) using predictors.
+3. Similary identify stresses affecting Gender
+4. Can the different stress categories be good predictors
+    - For each of Cognitive, Environmental, Psychological stress groups
+        - Logistic regression and variable selection using p-value,
+        - LDA models
+
+I will describe the methodology in detail for predicting school. The analysis for the other questions is similar. The code and detailed analysis  are skipped for simplicity.
+
+# Prediction for school
+
+```{r very-simple-model, echo=T, message=F}
+# use all questions and do logistic
+glm.fit_all_train <- glm(school ~.,  data = df_diff_stress_group_removed, 
+                  subset = train, family = binomial)
+
+```
+
+```{r echo=F, message=F}
+# compute the prediction percentage
+# glm.prob = predict(glm.fit_all_train, newdata = df_diff_stress_group_removed[-train,],
+#                  family = binomial, type =  "response")
+# 
+# glm.pred = rep("pvt",45)
+# glm.pred[glm.prob < 0.5] = "corp"
+# glm.pred <- as.factor(glm.pred)
+# 
+# table(glm.pred,df_diff_stress_group_removed$school[-train])
+# mean(glm.pred==df_diff_stress_group_removed$school[-train])
+# 
+# # 0.6222222
+# # prediction accuracy is 62.2%
+# summary(glm.prob)
+#see p-values. none are significant
+```
+
+Training failed!
+
+-  Training **did not converge** because training set size is three times small than the number of predictors. 
+- Therefore fisher scoring iteration is 25. 
+- Standard error is in the order of *30K*. 
+- Prediction probability values are all certain (zero or one). 
+Therefore we cannot use all the questions for prediction.  
+
+We want to reduce the number of predictors for the following reasons:
+1. Not all questions are useful to predict school.  Maybe we can improve by using smaller subset.
+2. You want a small set to focus on improving issues in schools or in counseling.
+3. Exhaustive subset search is too expensive 2^34 ~16B models. Automatic variable selection is discouraged for logistic regression.
+
+
+## Lasso for shrinkage
+First we will use **lasso** to reduce the questions on which we can predict.
+
+We fix the grid of lambda values for stability and uniformity across all the prediction problems below.
+http://www.sthda.com/english/articles/36-classification-methods-essentials/149-penalized-logistic-regression-essentials-in-r-ridge-lasso-and-elastic-net/
+
+```{r stress-school_lasso-cv}
+# CV-lasso cross validation
+x_school_lasso = model.matrix(school ~ . -1, data = df_diff_stress_group_removed)
+y_school_lasso = df_diff_stress_group_removed$school
+
+
+cv.tr.school = cv.glmnet(x_school_lasso[train,], y_school_lasso[train], 
+                         alpha = 1, lambda = grid, family = "binomial")
+plot(cv.tr.school)
+
+# lambda value that minimized the cross validation error
+bestlam = cv.tr.school$lambda.min
+
+# get the prediction and check how well it does.
+cv.pred.school = predict(cv.tr.school, newx = x_school_lasso[-train, ], 
+                         s = bestlam, type = "class")
+
+pred.school <- mean(cv.pred.school == df_diff_stress_group_removed$school[-train])
+
+names(which(predict(cv.tr.school, s = bestlam, type = "coefficients", 
+              family = binomial)[1:34,] !=0))
+```
+
+There are zero degrees of freedom for the first 89 lambda values. The best value of lambda selected by the method is `r bestlam`. The prediction accuracy is `r pred.school*100`.
+
+Now that we know we need a smallset of questions `Grade + Q2 + Q4 + Q5 + Q12 + Q15 + Q16 + Q17 + Q19 + Q20 + Q22 + Q26 + Q27 + Q30`. The plot below visually demonstrates the difference between the two schools in the response.
+
+```{r echo=F}
+df_stress_graph <- df_diff_stress_group_removed %>% dplyr::select(Grade , Q2 , Q4 , Q5 , Q12 , Q15 , Q16 , Q17, Q19 , Q20 , Q22, Q26, Q27, Q30, school)
+df_stress_graph.melt <- melt(df_stress_graph)
+ggplot(df_stress_graph.melt, aes(x=variable, y=value, color=school)) +
+  geom_boxplot(position = 'dodge', stat = 'boxplot')
+```
+
+```{r}
+table(df_diff_stress_group_removed$school, df_diff_stress_group_removed$Q4)
+```
+
+`cv.glmnet()` does not provide p-values. So we will obtain the p-values for its significance using `glm()` method.
+
+```{r simplify-school-model-p-values}
+
+# pick the questions from lasso and fit GLM
+glm.fit_stress <- glm(school ~ Grade + Q2 + Q4 + Q5 + Q12 + Q15 + Q16 + Q17 
+                      + Q19 + Q20 + Q22 + Q26 + Q27 + Q30,subset = train,
+                      data = df_diff_stress_group_removed,
+                      family = binomial)
+# predict the values
+pred.stress.questions <- predict(glm.fit_stress, 
+                              newdata = df_diff_stress_group_removed[-train,], 
+                                       type = "response")
+
+questions.school <- ifelse(pred.stress.questions > 0.5, "pvt", "corp")
+questions.school <- as.factor(questions.school)
+school_pred <-mean(questions.school == df_diff_stress_group_removed$school[-train])
+# find the coeff with good p-values
+summary(glm.fit_stress)
+```
+
+p-values for the predictors suggest that everything except `Grade + Q17 + Q22 + Q30` can be skipped without decreasing the predictive accuracy; sometimes predictive accuracy might actually increase. However, this is not always the case, it is possible that the individual predictors with low p-values might not have a significant effect individually but might be useful in combination with other predictors. Since there is no guarantee of the predictive accuracy of shrinkage, we will use validation to check the prediction accuracy. 
+ (http://maths-people.anu.edu.au/~johnm/courses/dm/math3346/2008/pdf/r-exercisesVI.pdf)
+
+```{r validation-p-values-based-model}
+#prediction accuracy is 64.4%
+# now try to do validation for the small set of questions.
+glm.fit_stress.small.questions <- glm(school ~ Grade + Q17 + Q22 + Q30, 
+                                      data = df_diff_stress_group_removed, 
+                                      subset = train, family = binomial)
+# predict the values
+pred.stress.small.questions <- predict(glm.fit_stress.small.questions, 
+                                       newdata = df_diff_stress_group_removed[-train,], 
+                                       type = "response")
+
+small.questions.school <- ifelse(pred.stress.small.questions > 0.5, "pvt", "corp")
+small.questions.school <- as.factor(small.questions.school)
+school_pred_small <- mean(small.questions.school == df_diff_stress_group_removed$school[-train])
+```
+
+The predictive accuracy of the model is `r school_pred_small * 100`. Since this is less than the previous model (71.1%), we prefer the lasso model. 
+
+## LDA for school
+We will next consider using LDA to build a model.
+
+
+```{r LDA-for-school-stress}
+
+# stress questions show 77.78 % effect on school. 
+
+lda.fit_train.school <- lda(school ~., 
+                     data = df_diff_stress_group_removed,subset=train )
+plot(lda.fit_train.school)
+lda.fit.values <- predict(lda.fit_train.school, df_diff_stress_group_removed[-train,])
+
+table(lda.fit.values$class, df_diff_stress_group_removed[-train,]$school)
+lda_school_pred <- mean(lda.fit.values$class == 
+                          df_diff_stress_group_removed[-train,]$school)
+```
+Modeling with LDA using  all variables gives a prediction accuracy of `r lda_school_pred* 100`. From the plot, we see that there is a small overlap of the distributions between the schools.  This leads to misclassification in the region of overlap.
+
+Now can we pick a smaller set of questions by thresholding? The variables with threshold of 0.9 and 0.7 we do not seem to improve the prediction accuracy.
+
+
+```{r echo=F, message=F}
+# use small set of data for train sample
+lda.fit_train.school.small <- lda(school~Grade, 
+                     data = df_diff_stress_group_removed,subset=train )
+lda.fit.values.small<- predict(lda.fit_train.school.small, 
+                               df_diff_stress_group_removed[-train,])
+lda_school_pred_small <- mean(lda.fit.values.small$class == 
+                              df_diff_stress_group_removed[-train,]$school) 
+```
+
+```{r}
+# find out the predictors for which the coefficient is greater than 0.9
+names(which(abs(coef(lda.fit_train.school))[1:32,]>0.9))
+table(lda.fit.values.small$class, df_diff_stress_group_removed[-train,]$school)
+
+```
+
+```{r echo=F, message=F}
+
+# use small set of data for train sample
+
+lda.fit_train.school.small.2 <- lda(school~Grade +Gender + Q2 +Q30,
+                     data = df_diff_stress_group_removed,subset=train )
+lda.fit.values.small.2<- predict(lda.fit_train.school.small.2, df_diff_stress_group_removed[-train,])
+
+lda_school_pred_small2 <- mean(lda.fit.values.small.2$class == df_diff_stress_group_removed[-train,]$school) 
+```
+
+```{r}
+
+# find out the predictors for which the coefficient is greater than 0.7
+names(which(abs(coef(lda.fit_train.school))[1:32,]>0.7))
+
+table(lda.fit.values.small.2$class, df_diff_stress_group_removed[-train,]$school)
+```
+
+The prediction accuracy for using these smaller set of variables is `r lda_school_pred_small * 100` and `r lda_school_pred_small2 * 100`, respectively.  Therefore this approach does not seem to give us a better prediction accuracy. From the table above, we see that error rate remains the same for the smaller set of predictors but the misclassification is in different directions.
+
+
+## Final model
+
+Based on the analysis above LDA has the best accuracy --- `r lda_school_pred * 100`%. Lasso is not significantly worse --- `r pred.school*100`. For either ther logistic or the LDA model, reducing the variables using p-values and thresholding does not improve prediction accuracy. For better interpretability and helping the counsellors with a smaller set of questions to focus we will use the variables selected by lasso.
+
+
+<hl> </hl>
+
+# Prediction accuracy for gender
+
+Using the same approaches to build a model. Lasso selects `Grade + Q2 + Q3 + Q4 + Q5 + Q9 + Q15 + Q16 + Q20 + Q21 + Q23 + Q24 + Q25 + Q26 + Q28 + Q29 + Q30` as the model. Using p-values we can select a smaller subset of `Grade +  Q4 +  Q5 + Q15 + Q20 + Q21 + Q30` predictors. In both these cases the prediction accuracy is 55.56%.
+
+Since the prediction accuracy is poor, it is likely that both the genders have similar responses to the stresses. Boys and girls are not affected significantly differently in our dataset.
+
+
+# Prediction accuracy for grades
+
+LDA and variable selection using thresholding from LDA give a prediction accuracy of 68%.  Lasso gives a 73.3% accuracy. p-value based subset selection does not improve the prediction accuracy. 
+
+Since LDA is very sensitive to outliers and many of the questions seem to have outliers in our dataset, the LDA methods were not very effective.
+ 
+ 
+                  
+# Are specific stresses better predictors?
+## Prediction accuracy using LDA
+
+|table | Grade | School | Gender|
+|------|:--------------|:--------------:|----:|
+|**Environmental**| 68.8% | 62% | 42%|
+|**Psychological** | 62% |  77% | 57%  |
+|**Cognitive** |71%|68%|55%
+
+## Prediction accuracy using Logistic and smaller set
+
+|table | Grade | School | Gender|             
+|------|:--------------|:--------------:|----:|
+|**Environmental**    |71.1% |64%  | 44%| 
+|**S-Environmental**  | 64%  |75%  | 60%|   
+|**Psychological**   |  60% |77.7% | 57%  |
+|**S-Psychological** |66%   |81%  | 51%  |  
+|**Cognitive**        |66%   |71.1%| 57.7% 
+|**S-Cognitive**      |68.8% |60%  | 48.8%|               
+  
+
+                  
+
+# Conclusion and Future work
+
+Identifying psychological stress and its effect on academic performance is an important topic. Here we tried to model the identification of stress as a prediction problem.
+
+We built models for prediction using logistic and linear discriminant analysis methods. Lasso was used to shrink the variables. We also tried to do variable selection using p-values in the case of logistic models and thresholding in LDA models. These approaches were used for all the questions in the questionnaire and for specific groups of stresses.
+
+- Lasso  based methods were effective in our analysis compared to LDA. LDA is sentitive to outliers and this could be a reason.
+- There is no significant difference in stresses between boys and girls.
+- Grade can be predicted with 73.3% accuracy.
+- School can be predicted with 71.1% accuracy.
+- Individual stress groups accuracy ...
+
+**Future work** 
+
+- Apply these methods to self-esteem and study habits questionnaire
+- Try to combine the datasets
+- Apply other predictive analysis techniques like tree-based methods.
+- Try to see if unsupervised learning classify students with similar stresses together. This can be helpful in group counseling settings.
+                  
+# Appendix                      
+
+## Lasso for gender
+Since we cannot validate on all the questions for the training dataset, we will start with lasso as before. Instead of using `cv.glmnet()`, we will use `glmnet()` and pick the best lambda based on test error.
+```{r lda-stress-lasso_gender, echo=F}
+
+x_gender = model.matrix(Gender ~ .-1,data = df_diff_stress_group_removed)
+y_gender = df_diff_stress_group_removed$Gender
+```
+
+```{r}
+# Lasso for training
+lasso.tr.gender = glmnet(x_gender[train,], y_gender[train], alpha = 1, 
+                            lambda = grid, family = "binomial")
+lasso.tr.gender$df
+```
+
+
+```{r echo=F}
+#Prediction accuracy 55.5%
+pred_gender = predict(lasso.tr.gender, newx = x_gender[-train,], type = "class")
+lasso_gender_accuracy <- mean(y_gender[-train] == pred_gender[,96])
+```
+
+Upto lambda = 89, degrees of freedom = 0 means only intercept is available.  No coefficients for any predictors.
+for lambda values from 90-100, the predictive accuracy is between 49 and 56%.  For the 93rd lambda value accuracy is  `r lasso_gender_accuracy`. 
+
+The predictors chosen by Lasso are:
+```{r echo=F}
+names(
+  which(
+    predict(lasso.tr.gender, s= 3.054e-02, 
+            type = "coefficients", family="binomial")[1:34,] 
+    != 0)
+  )
+```
+
+
+```{r gender-model-p-values}
+
+# pick the questions from lasso and fit GLM
+glm.fit_gender<- glm(Gender ~ Grade + Q2 + Q3 + Q4 + Q5 + Q9 + Q15 + Q16 + Q20 + Q21 + Q23 + Q24 + Q25 + Q26 + Q28 + Q29 
+                      + Q30, subset = train,
+                      data = df_diff_stress_group_removed,
+                      family = binomial)
+summary(glm.fit_gender)
+```
+
+
+```{r simplified-gender-model-p-values}
+# prediction accuracy 55%
+
+# pick the questions from lasso and fit GLM
+glm.fit_gender.pvalue<- glm(Gender ~ Grade + Q2 + Q9 + Q21 + Q25 + Q28 
+                      + Q30, subset = train,
+                      data = df_diff_stress_group_removed,
+                      family = binomial)
+
+# predict the values
+pred.gender.pvalue <- predict(glm.fit_gender.pvalue, 
+                                       newdata = df_diff_stress_group_removed[-train,], 
+                                       type = "response")
+
+gender.pvalue <- ifelse(pred.gender.pvalue > 0.5, "M", "F")
+gender.pvalue <- as.factor(gender.pvalue)
+gender_pred.pvalue <- mean(gender.pvalue == y_gender[-train])
+```
+
+
+
+```{r coeffs-with_gender-full-data}
+glm.fit_gender.full.data <- glm(Gender~ Grade +  Q4 +  Q5, +Q15 + Q20 + Q21 + Q30,
+                                data = df_diff_stress_group_removed,
+                                family = binomial) 
+summary(glm.fit_gender.full.data)
+```
+
+
+```{r LDA-for-Gender-stress}
+# Stress questions does not show significant effect on Gender. The percentage significance is 60%
+
+lda.fit_train_gender <- lda(Gender ~., 
+                     data = df_diff_stress_group_removed,subset=train )
+plot(lda.fit_train_gender)
+lda.fit.values.gender <- predict(lda.fit_train_gender, df_diff_stress_group_removed[-train,])
+
+table(lda.fit.values.gender$class, df_diff_stress_group_removed[-train,]$Gender)
+mean(lda.fit.values.gender$class == df_diff_stress_group_removed[-train,]$Gender)
+```
+
+coef(lda.fit_train.grade))[1:32,]>0.7
+
+```{r LDA-for-Gender-stress_small}
+# Stress questions does not show significant effect on Gender. The percentage significance is 55%
+
+lda.fit_train_gender_small <- lda(Gender ~Grade+school, 
+                     data = df_diff_stress_group_removed,subset=train )
+plot(lda.fit_train_gender_small)
+lda.fit.values.gender.small <- predict(lda.fit_train_gender_small, df_diff_stress_group_removed[-train,])
+
+table(lda.fit.values.gender.small$class, df_diff_stress_group_removed[-train,]$Gender)
+mean(lda.fit.values.gender.small$class == df_diff_stress_group_removed[-train,]$Gender)
+```
+
+
+# Lasso for Grade
+
+```{r stress-lasso_grade, echo=F}
+# Prediction accuracy of 73.3%
+x_grade = model.matrix(Grade ~ .-1,data = df_diff_stress_group_removed)
+y_grade = df_diff_stress_group_removed$Grade
+
+
+# Lasso for training
+lasso.tr.grade = glmnet(x_grade[train,], y_grade[train], alpha = 1, 
+                            lambda = grid, family = "binomial")
+
+pred_grade = predict(lasso.tr.grade, newx = x_grade[-train,], type = "class")
+lasso_grade_accuracy <- mean(y_grade[-train] == pred_grade[,92])
+names(
+  which(
+    predict(lasso.tr.grade, s= 9.326e-02, 
+            type = "coefficients", family="binomial")[1:34,] 
+    != 0)
+  )
+
+```
+
+```{r simplify-grade-model-p-values}
+
+# pick the questions from lasso and fit GLM
+glm.fit_grade<- glm(Grade ~ Gender + Q6 + Q24 + school,
+                       subset = train,
+                      data = df_diff_stress_group_removed,
+                      family = binomial)
+
+# predict the values
+pred.grade.small.questions <- predict(glm.fit_grade, 
+                                       newdata = df_diff_stress_group_removed[-train,], 
+                                       type = "response")
+
+grade.questions <- ifelse(pred.grade.small.questions > 0.5, "B", "A")
+grade.questions <- as.factor(grade.questions)
+grade_pred<-mean(grade.questions == y_grade[-train])
+
+# find the coeff with good p-values
+summary(glm.fit_grade)
+```
+## LDA for Grade
+
+
+```{r LDA-for-Grade-stress}
+
+# stress questions show 68 % effect on Grade. This indicates stress questions does not show significant effect on grade. When you reduce it to few variables it give 66%
+# Second set of small question 68%
+
+lda.fit_train.grade <- lda(Grade ~., 
+                     data = df_diff_stress_group_removed,subset=train )
+lda.fit_train.grade
+plot(lda.fit_train.grade)
+lda.fit.values <- predict(lda.fit_train.grade, df_diff_stress_group_removed[-train,])
+
+table(lda.fit.values$class, df_diff_stress_group_removed[-train,]$Grade)
+lda_grade_pred<- mean(lda.fit.values$class == df_diff_stress_group_removed[-train,]$Grade)
+
+# find out the predictors for which the coefficient is greater than 0.9
+names(which(abs(coef(lda.fit_train.grade))[1:32,]>0.9))
+# use small set of data for train sample
+lda.fit_train.grade.small <- lda(Grade ~Gender+Q21+school, 
+                     data = df_diff_stress_group_removed,subset=train )
+lda.fit_train.grade.small
+lda.fit.values.small<- predict(lda.fit_train.grade.small, df_diff_stress_group_removed[-train,])
+
+table(lda.fit.values.small$class, df_diff_stress_group_removed[-train,]$Grade)
+lda_grade_pred_small<-mean(lda.fit.values.small$class == df_diff_stress_group_removed[-train,]$Grade) 
+
+# find out the predictors for which the coefficient is greater than 0.7
+names(which(abs(coef(lda.fit_train.grade))[1:32,]>0.7))
+
+# use small set of data for train sample
+
+lda.fit_train.grade.small.2 <- lda(Grade ~Gender+Q21+Q2+school, 
+                     data = df_diff_stress_group_removed,subset=train )
+lda.fit_train.grade.small.2
+lda.fit.values.small.2<- predict(lda.fit_train.grade.small.2, df_diff_stress_group_removed[-train,])
+
+table(lda.fit.values.small.2$class, df_diff_stress_group_removed[-train,]$Grade)
+lda_grade_pred_small.2<-mean(lda.fit.values.small.2$class == df_diff_stress_group_removed[-train,]$Grade) 
+
+# find out the predictors for which the coefficient is greater than 0.5
+names(which(abs(coef(lda.fit_train.grade))[1:32,]>0.5))
+# use small set of data for train sample
+
+
+lda.fit_train.grade.small.3 <- lda(Grade ~Gender+Q21+Q2+Q5+school, 
+                     data = df_diff_stress_group_removed,subset=train )
+lda.fit_train.grade.small.3
+lda.fit.values.small.3<- predict(lda.fit_train.grade.small.3, df_diff_stress_group_removed[-train,])
+
+table(lda.fit.values.small.3$class, df_diff_stress_group_removed[-train,]$Grade)
+lda_grade_pred_small.3<-mean(lda.fit.values.small.3$class == df_diff_stress_group_removed[-train,]$Grade) 
+
+
+```
+
+## Conclusion
+
+|ALL| school         |Gender          |Grade |
+|------|:--------------|:--------------:|----  |
+|**Lasso**||55.5%|73.3% 
+|**LDA**  |77.8%|  60%   |68.8%
+|**LDA_small_set**| 
+
+
+
+# Are specific stresses better predictors?
+
+## Gender with envt questions
+Let us compare LDA and Logistic methods
+
+```{r LDA-for-gender-envt-stress}
+## Gender with all envt questions only 42.2%%
+lda.fit.gender.envt.stress.train <- lda(Gender ~ school + Grade + Q1 + Q8 + Q11 + Q12
+                                  + Q15 + Q19 + Q20 + Q21 + Q23 + Q24 + Q25 + Q30,
+                                        data = df_diff_stress_group_removed, 
+                                        subset = train)
+
+lda.fit.values.gender.envt.stress <- predict(lda.fit.gender.envt.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.gender.envt.stress$class, 
+#      df_diff_stress_group_removedGender[-train])
+gender.envt.predict.lda = mean(lda.fit.values.gender.envt.stress$class == 
+       df_diff_stress_group_removed$Gender[-train])
+
+# 42.2 % accuracy
+# data.frame(lda.fit.values.gender.envt.stress$posterior, 
+#           pred_gender = lda.fit.values.gender.envt.stress$class, 
+#           real.gender= df_diff_stress_group_removed$Gender[-train])
+```
+
+
+```{r glm-envt-gender}
+gender.glm.fit <- glm(Gender ~school + Grade + Q1 + Q8 + Q11 + Q12 + Q15 + Q19 +
+                                          Q20 + Q21 + Q23 + Q24 + Q25 + Q30,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+gender.glm.pred <- predict(gender.glm.fit,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+gender.envt.predict.glm = mean(ifelse(gender.glm.pred > 0.5, "M", "F") == df_diff_stress_group_removed$Gender[-train])
+contrasts(df_diff_stress_group_removed$Gender)
+ 
+# 44 % accuracy
+summary(gender.glm.fit)
+# p-value suggests Grade,Q21+ Q30
+# so fit a model for only those questions
+```
+
+```{r glm-gender-envt-pvalue}
+gender.glm.fit.small <- glm(Gender ~ Grade +Q21+ Q30,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+gender.glm.pred.small <- predict(gender.glm.fit.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+gender.envt.small.glm = mean(ifelse(gender.glm.pred.small > 0.5, "M", "F") == df_diff_stress_group_removed$Gender[-train])
+#predictive power is still 60 %
+```
+
+<hr> </hr>
+
+1. Why not use lasso or ridge for specific stress questions?  at most 7 predictors.
+2. Why not use subset selection:  p-value cannot be used or interpreted for classification problems.
+More discussion:
+- https://stats.stackexchange.com/questions/20836/algorithms-for-automatic-model-selection/20856#20856
+- https://www.stata.com/support/faqs/statistics/stepwise-regression-problems/
+
+
+### Grade with envt question
+
+```{r LDA-for-Grade-envt-stress}
+## Grade with all envt questions only 68.8 %
+lda.fit.grade.envt.stress.train <- lda(Grade ~ school + Gender + Q1 + Q8 + Q11 + Q12                                     + Q15 + Q19 +Q20 + Q21 + Q23 + Q24 + Q25 + Q30,
+                                      data = df_diff_stress_group_removed, 
+                                        subset = train)
+
+                                        
+lda.fit.values.grade.envt.stress <- predict(lda.fit.grade.envt.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.grade.envt.stress$class, 
+#      df_diff_stress_group_removed$Grade[-train])
+lda.grade<- mean(lda.fit.values.grade.envt.stress$class == 
+       df_diff_stress_group_removed$Grade[-train])
+
+# 68.8 % accuracy
+# data.frame(lda.fit.values.grade.envt.stress$posterior, 
+#           pred_grade = lda.fit.values.grade.envt.stress$class, 
+#           real.grade= df_diff_stress_group_removed$Grade[-train])
+```
+
+```{r glm-envt-grade}
+glm.fit.grade.envt <- glm(Grade ~ school + Gender + Q1 + Q8 + Q11 + Q12 + Q15 + Q19 +
+                                          Q20 + Q21 + Q23 + Q24 + Q25 + Q30,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+glm.pred.grade.envt <- predict(glm.fit.grade.envt, newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+glm.grade<- mean(ifelse(glm.pred.grade.envt > 0.5, "B", "A") == df_diff_stress_group_removed$Grade[-train])
+contrasts(df_diff_stress_group_removed$Grade)
+
+
+# 71.1% accuracy
+summary(glm.fit.grade.envt)
+# p-value suggests school,gender,Q12,Q21,Q23,Q24
+# so fit a model for only those questions
+```
+
+```{r glm-grade-envt-pvalue}
+glm.fit.grade.envt.small <- glm(Grade ~ school+Gender+ Q12,Q21+Q23+Q24,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+glm.pred.grade.envt.small <- predict(glm.fit.grade.envt.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+glm.grade.small<-mean(ifelse(glm.pred.grade.envt.small > 0.5, "B", "A") == df_diff_stress_group_removed$Grade[-train])
+#predictive power is still 64%
+summary(glm.fit.grade.envt.small)
+```
+
+Moral: shrinkage due to p-values did not help in improving prediction accuracy. 
+
+
+TODO: Residual deviance and AIC can explain?
+AIC (Akaike Information Criteria) – The analogous metric of adjusted R² in logistic regression is AIC. AIC is the measure of fit which penalizes model for the number of model coefficients. Therefore, we always prefer model with minimum AIC value.
+
+Null Deviance and Residual Deviance – Null Deviance indicates the response predicted by a model with nothing but an intercept. Lower the value, better the model. Residual deviance indicates the response predicted by a model on adding independent variables. Lower the value, better the model.
+
+##School-envt stress questions
+
+```{r LDA-for-school-envt-stress}
+## school with all envt questions only 62 %
+lda.fit.school.envt.stress.train <- lda(school ~ Gender + Grade + Q1 + Q8 + Q11 + Q12 
+                               +Q15 + Q19 + Q20 + Q21 + Q23 + Q24 + Q25 + Q30,
+                                        data = df_diff_stress_group_removed, 
+                                        subset = train)
+
+lda.fit.values.school.envt.stress <- predict(lda.fit.school.envt.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.grade.envt.stress$class, 
+#      df_diff_stress_group_removed$Grade[-train])
+lda.school<-mean(lda.fit.values.school.envt.stress$class == 
+       df_diff_stress_group_removed$school[-train])
+# 62 % accuracy
+# data.frame(lda.fit.values.school.envt.stress$posterior, 
+#           pred_school = lda.fit.values.school.envt.stress$class, 
+#           real.school= df_diff_stress_group_removed$school[-train])
+```
+
+```{r glm-envt-school}
+glm.fit.school.envt <- glm(school~ Gender + Grade + Q1 + Q8 + Q11 + Q12 + Q15 + Q19 +
+                                          Q20 + Q21 + Q23 + Q24 + Q25 + Q30,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+glm.pred.school.envt <- predict(glm.fit.school.envt, newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+glm.school<-mean(ifelse(glm.pred.school.envt>0.5, "pvt", "corp") ==      df_diff_stress_group_removed$school[-train])
+contrasts(df_diff_stress_group_removed$school)
+# 64 % accuracy
+summary(glm.fit.school.envt)
+# p-value suggests grade,Q15,Q20,Q30
+# so fit a model for only those questions
+```
+
+```{r glm-school-envt-pvalue}
+glm.fit.school.envt.small <- glm(school ~ Grade + Q15 + Q20 + Q30,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+glm.pred.school.envt.small <- predict(glm.fit.school.envt.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+glm.school.small<-mean(ifelse(glm.pred.school.envt.small > 0.5, "pvt", "corp") == df_diff_stress_group_removed$school[-train])
+#predictive power is still 75.5%
+summary(glm.fit.school.envt.small)
+```
+
+## Gender with Cognitive stress
+
+```{r LDA-for-gender-cog -stress}
+## Gender with all cog questions only 55%%
+lda.fit.gender.cog.stress.train <- lda(Gender ~ school + Grade + Q2 + Q4 + Q5 + Q16 + 
+                                          Q22 + Q28,data = df_diff_stress_group_removed, 
+                                          subset = train)
+                                        
+
+lda.fit.values.gender.cog.stress <- predict(lda.fit.gender.cog.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.gender.cog.stress$class, 
+#      df_diff_stress_group_removed$Gender[-train])
+mean(lda.fit.values.gender.cog.stress$class == 
+       df_diff_stress_group_removed$Gender[-train])
+# 55 % accuracy
+# data.frame(lda.fit.values.gender.cog.stress$posterior, 
+#           pred_gender = lda.fit.values.gender.cog.stress$class, 
+#           real.gender= df_diff_stress_group_removed$Gender[-train])
+```
+
+```{r glm-cog-gender}
+gender.glm.cog.fit <- glm(Gender ~school + Grade + Q2 + Q4 + Q5 + Q16 + Q22 + Q28,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+                                        
+gender.glm.cog.pred <- predict(gender.glm.cog.fit,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+mean(ifelse(gender.glm.cog.pred > 0.5, "M", "F") == df_diff_stress_group_removed$Gender[-train])
+contrasts(df_diff_stress_group_removed$Gender)
+ 
+# 57.7% accuracy
+summary(gender.glm.cog.fit)
+# p-value suggests Q5
+# so fit a model for only those questions
+```
+
+```{r glm-gender-cog-pvalue}
+gender.glm.fit.cog.small <- glm(Gender ~  Q5,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+gender.glm.pred.cog.small <- predict(gender.glm.fit.cog.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+mean(ifelse(gender.glm.pred.cog.small > 0.5, "M", "F") == df_diff_stress_group_removed$Gender[-train])
+#predictive power is still 48.8%
+```
+
+ 
+## Grade with cognitive stress 
+  
+  
+  
+```{r LDA-for-grade-cog-stress}
+## Grade with all cog questions only 71%%
+lda.fit.grade.cog.stress.train <- lda(Grade ~ school + Gender + Q2 + Q4 + Q5 + Q16 + 
+                                Q22 + Q28,  data = df_diff_stress_group_removed, 
+                                                                 subset = train)
+                                        
+
+lda.fit.values.grade.cog.stress <- predict(lda.fit.grade.cog.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.grade.cog.stress$class, 
+#      df_diff_stress_group_removed$Grade[-train])
+mean(lda.fit.values.grade.cog.stress$class == 
+       df_diff_stress_group_removed$Grade[-train])
+# Predict with small questions with coef >0.6
+names(which(abs(coef(lda.fit.grade.cog.stress.train))>0.6))
+
+lda.fit.grade.cog.stress.train.small<- lda(Grade ~ school + Gender,  data =  
+                                           df_diff_stress_group_removed,                                                                  subset = train)
+                                        
+
+lda.fit.values.grade.cog.stress.small <- predict(lda.fit.grade.cog.stress.train.small,
+                                          df_diff_stress_group_removed[-train,])
+mean(lda.fit.values.grade.cog.stress.small$class == 
+       df_diff_stress_group_removed$Grade[-train])
+
+# % accuracy
+# data.frame(lda.fit.values.grade.cog.stress$posterior, 
+#           pred_grade = lda.fit.values.grade.cog.stress$class, 
+#           real.grade= df_diff_stress_group_removed$Grade[-train])
+```
+
+```{r glm-cog-grade}
+grade.glm.cog.fit <- glm(Grade ~school + Gender + Q2 + Q4 + Q5 + Q16 + 
+                                          Q22 + Q28,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+grade.glm.cog.pred <- predict(grade.glm.cog.fit,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+mean(ifelse(grade.glm.cog.pred>0.5, "B", "A") == df_diff_stress_group_removed$Grade[-train])
+contrasts(df_diff_stress_group_removed$Grade)
+ 
+# 66.6% accuracy
+summary(grade.glm.cog.fit)
+# p-value suggests school
+# so fit a model for only those questions
+```
+
+```{r glm-grade-cog-pvalue}
+grade.glm.fit.cog.small <- glm(Grade ~ school,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+grade.glm.pred.cog.small <- predict(grade.glm.fit.cog.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type = "response" )
+mean(ifelse(grade.glm.pred.cog.small > 0.5, "B", "A") == df_diff_stress_group_removed$Grade[-train])
+#predictive power is still 68.8%
+```
+
+## school with cognitive stress 
+
+
+
+```{r LDA-for-school-cog-stress}
+## school with all cog questions only 68.8%
+lda.fit.school.cog.stress.train <- lda(school ~ Grade + Gender + Q2 + Q4 + Q5 + Q16 + 
+                                       Q22 + Q28,data = df_diff_stress_group_removed,   
+                                                                    subset = train)
+                                        
+
+lda.fit.values.school.cog.stress <- predict(lda.fit.school.cog.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.school.cog.stress$class, 
+#      df_diff_stress_group_removed$school[-train])
+mean(lda.fit.values.school.cog.stress$class == 
+       df_diff_stress_group_removed$school[-train])
+# 68.8 % accuracy
+# data.frame(lda.fit.values.school.cog.stress$posterior, 
+#           pred_school = lda.fit.values.school.cog.stress$class, 
+#           real.school= df_diff_stress_group_removed$school[-train])
+```
+
+```{r glm-cog-school}
+school.glm.cog.fit <- glm(school ~Grade + Gender + Q2 + Q4 + Q5 + Q16 + 
+                                    Q22 + Q28, data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)      
+                               
+school.glm.cog.pred <- predict(school.glm.cog.fit,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+mean(ifelse(school.glm.cog.pred>0.5, "pvt", "corp") == df_diff_stress_group_removed$school[-train])
+contrasts(df_diff_stress_group_removed$school)
+ 
+# 71.1% accuracy
+summary(school.glm.cog.fit)
+# p-value suggests Grade,Q16
+# so fit a model for only those questions
+```
+
+```{r glm-school-cog-pvalue}
+school.glm.fit.cog.small <- glm(school~ Grade +  Q16,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+school.glm.pred.cog.small <- predict(school.glm.fit.cog.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type = "response" )
+mean(ifelse(school.glm.pred.cog.small > 0.5, "pvt", "corp") == df_diff_stress_group_removed$school[-train])
+#predictive power is still 60%
+```
+  
+  
+## School with Psychological stress
+  
+  
+```{r LDA-for-school-pschy-stress}
+## school with all pschy questions only 77%
+lda.fit.school.pschy.stress.train <- lda(school ~ Grade + Gender +  
+                                      Q3+Q6+Q7+Q9+Q10+Q13+Q14+Q17+Q18+Q26+Q27,  
+                                       data = df_diff_stress_group_removed, 
+                                        subset = train)
+      
+                                        
+lda.fit.values.school.pschy.stress <- predict(lda.fit.school.pschy.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.school.pschy.stress$class, 
+#      df_diff_stress_group_removed$school[-train])
+lda.school.pschy<-mean(lda.fit.values.school.pschy.stress$class == 
+       df_diff_stress_group_removed$school[-train])
+#77% accuracy
+# data.frame(lda.fit.values.school.pschy.stress$posterior, 
+#           pred_school = lda.fit.values.school.pschy.stress$class, 
+#           real.school= df_diff_stress_group_removed$school[-train])
+```
+
+```{r glm-pschy-school}
+school.glm.pschy.fit <- glm(school ~ Grade + Gender + 
+                                 Q3+Q6+Q7+Q9+Q10+Q13+Q14+Q17+Q18+Q26+Q27,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+school.glm.pschy.pred <- predict(school.glm.pschy.fit,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+glm.school.pschy<-mean(ifelse(school.glm.pschy.pred>0.5, "pvt", "corp") == df_diff_stress_group_removed$school[-train])
+contrasts(df_diff_stress_group_removed$school)
+ 
+# 77.7% accuracy
+summary(school.glm.pschy.fit)
+# p-value suggests Gender, Q17,Q26,Q27
+# so fit a model for only those questions
+```
+
+```{r glm-school-pschy-pvalue}
+school.glm.fit.pschy.small <- glm(school~  Gender + Q17 + Q26 + Q27,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+school.glm.pred.pschy.small <- predict(school.glm.fit.pschy.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type = "response" )
+small.pschy.school<-mean(ifelse(school.glm.pred.pschy.small > 0.5, "pvt", "corp") == df_diff_stress_group_removed$school[-train])
+#predictive power is still 81%
+```
+
+## Gender with psychological stress
+
+```{r LDA-for-gender-pschy-stress}
+## gender with all pschy questions only 57 %
+lda.fit.gender.pschy.stress.train <- lda(Gender ~ school + Grade + Q3+Q6+Q7+Q9+Q10+Q13+Q14+Q17+Q18+Q26+Q27,
+                                        data = df_diff_stress_group_removed, 
+                                        subset = train)
+
+lda.fit.values.gender.pschy.stress <- predict(lda.fit.gender.pschy.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.gender.pschy.stress$class, 
+#      df_diff_stress_group_removed$Genderl[-train])
+lda.gender.pschy<-mean(lda.fit.values.gender.pschy.stress$class == 
+       df_diff_stress_group_removed$Gender[-train])
+# 57% accuracy
+# data.frame(lda.fit.values.gender.pschy.stress$posterior, 
+#           pred_gender = lda.fit.values.gender.pschy.stress$class, 
+#           real.gender= df_diff_stress_group_removed$Gender[-train])
+```
+
+```{r glm-pschy-gender}
+gender.glm.pschy.fit <- glm(Gender ~Grade+school+         Q3+Q6+Q7+Q9+Q10+Q13+Q14+Q17+Q18+Q26+Q27,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+gender.glm.pschy.pred <- predict(gender.glm.pschy.fit,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+glm.gender.pschy<-mean(ifelse(gender.glm.pschy.pred > 0.5, "M", "F") == df_diff_stress_group_removed$Gender[-train])
+contrasts(df_diff_stress_group_removed$Gender)
+ 
+# 57.7% accuracy
+summary(gender.glm.pschy.fit)
+# p-value suggests Q9
+# so fit a model for only those questions
+```
+
+```{r glm-gender-pschy-pvalue}
+gender.glm.fit.pschy.small <- glm(Gender~ Q9,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+gender.glm.pred.pschy.small <- predict(gender.glm.fit.pschy.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type = "response" )
+glm.small.pschy<-mean(ifelse(gender.glm.pred.pschy.small > 0.5, "M", "F") == df_diff_stress_group_removed$Gender[-train])
+#predictive power is still 51%
+```
+
+## Grade with psychological stress
+
+```{r LDA-for-grade-pschy-stress}
+## grade with all pschy questions only 62%
+lda.fit.grade.pschy.stress.train <- lda(Grade ~ school+Gender+ Q3+Q6+Q7+Q9+Q10+Q13+Q14+Q17+Q18+Q26+Q27,
+                                        data = df_diff_stress_group_removed, 
+                                        subset = train)
+
+lda.fit.values.grade.pschy.stress <- predict(lda.fit.grade.pschy.stress.train,
+                                          df_diff_stress_group_removed[-train,])
+
+#table(lda.fit.values.grade.pschy.stress$class, 
+#      df_diff_stress_group_removed$Grade[-train])
+lda.grade.pschy<-mean(lda.fit.values.grade.pschy.stress$class == 
+       df_diff_stress_group_removed$Grade[-train])
+#  62% accuracy
+# data.frame(lda.fit.values.grade.pschy.stress$posterior, 
+#           pred_gender = lda.fit.values.grade.pschy.stress$class, 
+#           real.gender= df_diff_stress_group_removed$Grade[-train])
+```
+
+
+```{r glm-pschy-grade}
+grade.glm.pschy.fit <- glm(Grade ~Gender+school+ Q3+Q6+Q7+Q9+Q10+Q13+Q14+Q17+Q18+Q26+Q27,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+grade.glm.pschy.pred <- predict(grade.glm.pschy.fit,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type =  "response" )
+glm.pschy.grade<-mean(ifelse(grade.glm.pschy.pred > 0.5, "B", "A") == df_diff_stress_group_removed$Grade[-train])
+contrasts(df_diff_stress_group_removed$Grade)
+ 
+# 60 % accuracy
+summary(grade.glm.pschy.fit)
+# p-value suggests Gender,school
+# so fit a model for only those questions
+```
+
+
+
+```{r glm-grade-pschy-pvalue}
+grade.glm.fit.pschy.small <- glm(Grade~ Gender+ school,
+                                        data = df_diff_stress_group_removed,
+                                        subset = train, family = binomial)
+grade.glm.pred.pschy.small <- predict(grade.glm.fit.pschy.small,newdata = df_diff_stress_group_removed[-train,],
+                  family = binomial, type = "response" )
+small.glm.grade<-mean(ifelse(grade.glm.pred.pschy.small > 0.5, "B", "A") == df_diff_stress_group_removed$Grade[-train])
+#predictive power is still 66%
+```
+
+
+
+
